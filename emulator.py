@@ -20,7 +20,9 @@ class MC(Mqtt_client):
     def on_message(self, client, userdata, msg):
         topic = msg.topic
         m_decode = str(msg.payload.decode("utf-8", "ignore"))
-        self.emulator_instance.handle_incoming_command(topic, m_decode)
+        QMetaObject.invokeMethod(self.emulator_instance, "handle_incoming_command",
+                                 Qt.QueuedConnection,
+                                 Q_ARG(str, topic), Q_ARG(str, m_decode))
 
 class ConnectionDock(QDockWidget):
     def __init__(self, mc, name, topic_sub, topic_pub):
@@ -56,8 +58,13 @@ class ConnectionDock(QDockWidget):
         self.mc.set_clientName(f"AquaGuard_Emulator_{random.randrange(1,10000)}")
         self.mc.connect_to()
         self.mc.start_listening()
+        
         if self.topic_sub:
             self.mc.subscribe_to(self.topic_sub)
+            
+        # The Temperature sensor must listen to the heater commands to know when to heat up
+        if 'temp' in self.topic_sub:
+            self.mc.subscribe_to(comm_topic + 'heater/sub')
 
     def update_state_display(self, text):
         self.ValueDisplay.setText(text)
@@ -76,7 +83,11 @@ class MainWindow(QMainWindow):
         
         self.current_temp = 22.0
         self.target_temp = 22.0
+        self.auto_min = 26.0
+        self.auto_max = 30.0
         self.heating_mode = "OFF" 
+        self.is_actively_heating = False
+        
         self.light_mode = "MANUAL_OFF" 
         self.force_motion = False
         
@@ -84,12 +95,13 @@ class MainWindow(QMainWindow):
         self.timer.timeout.connect(self.create_data)
         self.timer.start(self.update_rate * 1000)
 
-        self.setGeometry(100, 100, 320, 130)
+        self.setGeometry(100, 100, 340, 130)
         self.setWindowTitle(self.name)
         
         self.connectionDock = ConnectionDock(self.mc, self.name, self.topic_sub, self.topic_pub)
         self.addDockWidget(Qt.TopDockWidgetArea, self.connectionDock)
 
+    @pyqtSlot(str, str)
     def handle_incoming_command(self, topic, message):
         if 'heater' in topic:
             if 'MANUAL:' in message:
@@ -100,12 +112,16 @@ class MainWindow(QMainWindow):
                     pass
             elif 'AUTO:' in message:
                 try:
-                    self.target_temp = float(message.split(':')[1])
+                    values = message.split(':')[1].split(',')
+                    self.auto_min = float(values[0])
+                    self.auto_max = float(values[1])
                     self.heating_mode = "AUTO"
+                    self.is_actively_heating = False
                 except:
                     pass
             elif message == 'OFF':
                 self.heating_mode = "OFF"
+                self.is_actively_heating = False
                 
         elif 'light' in topic:
             if message in ["MANUAL_ON", "MANUAL_OFF", "AUTO"]:
@@ -134,9 +150,14 @@ class MainWindow(QMainWindow):
                 else:
                     self.heating_mode = "OFF" 
             elif self.heating_mode == "AUTO":
-                if self.current_temp < self.target_temp:
+                if self.current_temp <= self.auto_min:
+                    self.is_actively_heating = True
+                elif self.current_temp >= self.auto_max:
+                    self.is_actively_heating = False
+                    
+                if self.is_actively_heating:
                     self.current_temp += 0.5
-                elif self.current_temp > 22.0 and self.current_temp >= self.target_temp:
+                elif self.current_temp > 22.0:
                     self.current_temp -= 0.1 
             else: 
                 if self.current_temp > 22.0:
@@ -149,10 +170,7 @@ class MainWindow(QMainWindow):
             if self.heating_mode == "MANUAL":
                 status = f"Heating ON (Target: {self.target_temp}°C)"
             elif self.heating_mode == "AUTO":
-                if self.current_temp < self.target_temp:
-                    status = f"Auto-Heating ON (Target: {self.target_temp}°C)"
-                else:
-                    status = f"Auto-Heating Standby"
+                status = f"Auto Mode (Min: {self.auto_min}°C, Max: {self.auto_max}°C)"
             else:
                 status = "OFF"
             
@@ -167,7 +185,7 @@ class MainWindow(QMainWindow):
             elif self.light_mode == "MANUAL_OFF":
                 light_state = "OFF"
             else:
-                light_state = "ON (Auto)" if ambient_lux < 300 else "OFF (Auto)"
+                light_state = "ON (Auto-Darkness)" if ambient_lux < 300 else "OFF (Auto-Daylight)"
                 
             current_data = f"From: {self.name} Lux: {ambient_lux} | Light: {light_state}"
             self.connectionDock.update_state_display(f"Sensor: {ambient_lux}Lux | Output: {light_state}")
